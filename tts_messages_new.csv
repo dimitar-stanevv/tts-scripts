@@ -1,0 +1,26 @@
+filename;description;en
+alert_avgspeed_entering;Played when user has just entered a section control segment;You are entering an average speed zone!
+alert_avgspeed_exiting;Played when user has just exited a section control segment through an exit point;You are leaving an average speed zone.
+alert_avgspeed_no_longer;Played when used has just exited a section control segment not through an exit point (no longer in segment);You are no longer in an average speed zone.
+alert_avgspeed;Played when user is exceeding the average speed on the set tolerance in a section control segment;You are exceeding the average speed!
+alert_redlightcam;Played for static red light camera dangers;traffic signal camera
+alert_speedcam;Played for static speed cam dangers;speed camera
+alert_live_police;;police
+alert_live_police_mobile_camera;;mobile police camera
+alert_live_hazard_construction;;construction zone
+alert_live_hazard_accident;;accident
+alert_live_hazard_object_on_road;;object on road
+alert_live_hazard_vehicle_on_road;;vehicle on road
+alert_live_hazard_other;;hazard
+alert_live_hazard_pothole;;pothole
+alert_live_road_closure;;road closure
+alert_distance_in_100m;;in one hunder meters
+alert_distance_in_200m;;in 200 meters
+alert_distance_in_300m;;in 300 meters
+alert_distance_in_400m;;in 400 meters
+alert_distance_in_500m;;in 500 meters
+alert_distance_in_600m;;in 600 meters
+alert_distance_in_700m;;in 700 meters
+alert_distance_in_800m;;in 800 meters
+alert_distance_in_900m;;in 900 meters
+alert_prefix_approaching;;approaching
