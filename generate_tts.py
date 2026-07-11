@@ -116,8 +116,9 @@ def synthesize(text: str, settings: dict, api_key: str) -> bytes:
     payload = {
         "text":           text,
         "model_id":       settings["model_id"],
-        "voice_settings": settings["voice_settings"],
-        "speed":          settings["speed"],
+        # "speed" must live inside voice_settings; as a top-level field the API
+        # silently ignores it and renders at speed 1.0.
+        "voice_settings": {**settings["voice_settings"], "speed": settings["speed"]},
     }
     params = {"output_format": OUTPUT_FORMAT}
 
