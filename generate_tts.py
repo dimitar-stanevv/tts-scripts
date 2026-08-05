@@ -25,6 +25,7 @@ import argparse
 import configparser
 import csv
 import os
+import re
 import subprocess
 import sys
 import time
@@ -48,7 +49,18 @@ REQUESTS_PER_SEC = 2                     # rate-limit guard
 DEFAULT_VOICE_ID   = "WZlYpi1yf6zJhNWXih74"
 DEFAULT_MODEL_ID   = MODEL_ID
 DEFAULT_SPEED      = 1.05
-TAIL_TRIM_SECONDS  = 0.25   # seconds to trim from the end of every generated file
+# No tail trim by default. A fixed trim is unreliable: ElevenLabs leaves a
+# variable amount of trailing silence, so a fixed cut chopped the final word on
+# every file that had less silence than the trim. Leaving endings intact sounds
+# better than clipping words. (Still overridable via --trim-end for one-offs.)
+TAIL_TRIM_SECONDS  = 0.0
+
+# Loudness normalization: raw ElevenLabs output varies a lot per voice/language
+# (measured -16.6 to -22.1 LUFS across languages), so each file is measured and
+# then gained to the same integrated-loudness target. The limiter only catches
+# peaks that would clip after the gain.
+TARGET_LUFS     = -14.0   # EBU R128 integrated loudness target
+PEAK_CEILING_DB = -1.0    # limiter ceiling applied after the gain
 
 DEFAULT_VOICE_SETTINGS = {
     "stability":         1.0,
@@ -128,9 +140,37 @@ def synthesize(text: str, settings: dict, api_key: str) -> bytes:
     return response.content
 
 
-# ── MP3 bytes → FLAC file via ffmpeg ─────────────────────────────────────────
+# ── Loudness measurement (pass 1 of 2) ───────────────────────────────────────
+def measure_integrated_lufs(mp3_bytes: bytes | None = None,
+                            path: str | None = None) -> float | None:
+    """Measure EBU R128 integrated loudness of MP3 bytes (stdin) or a file.
+
+    Returns None when no loudness can be measured (e.g. silent audio).
+    """
+    source = ["-i", "pipe:0"] if mp3_bytes is not None else ["-i", str(path)]
+    # ebur128 prints its summary at the default (info) loglevel, so no
+    # "-loglevel error" here.
+    cmd = ["ffmpeg", *source, "-af", "ebur128", "-f", "null", "-"]
+    result = subprocess.run(cmd, input=mp3_bytes, capture_output=True)
+    stderr = result.stderr.decode(errors="replace")
+    if result.returncode != 0:
+        raise RuntimeError(stderr.strip().splitlines()[-1])
+    match = re.search(r"^\s*I:\s*(-?[0-9.]+)\s*LUFS", stderr, re.MULTILINE)
+    return float(match.group(1)) if match else None
+
+
+def loudness_filters(gain_db: float) -> list[str]:
+    """Gain to the loudness target, then a limiter so new peaks cannot clip."""
+    ceiling_linear = 10 ** (PEAK_CEILING_DB / 20)
+    return [
+        f"volume={gain_db:+.2f}dB",
+        f"alimiter=limit={ceiling_linear:.6f}:level=false",
+    ]
+
+
+# ── MP3 bytes → FLAC file via ffmpeg (pass 2 of 2) ───────────────────────────
 def mp3_bytes_to_flac(mp3_bytes: bytes, out_path: str, compression: str,
-                      trim_end: float = 0.0) -> None:
+                      trim_end: float = 0.0, gain_db: float | None = None) -> None:
     cmd = [
         "ffmpeg",
         "-loglevel", "error",
@@ -139,10 +179,15 @@ def mp3_bytes_to_flac(mp3_bytes: bytes, out_path: str, compression: str,
         "-c:a", "flac",
         "-compression_level", compression,
     ]
+    filters = []
     if trim_end > 0:
         # Reverse → trim from the new "start" (original tail) → reverse back.
         # Works without knowing the file duration upfront.
-        cmd += ["-af", f"areverse,atrim=start={trim_end},areverse"]
+        filters.append(f"areverse,atrim=start={trim_end},areverse")
+    if gain_db is not None:
+        filters += loudness_filters(gain_db)
+    if filters:
+        cmd += ["-af", ",".join(filters)]
     cmd += [
         "-n",                    # never overwrite
         out_path,
@@ -231,7 +276,8 @@ def build_lang_settings(lang_columns: list[str], config: dict,
 
 # ── Main batch processor ──────────────────────────────────────────────────────
 def process_csv(csv_path: str, out_dir: str, api_key: str, compression: str,
-                speed_override: float | None, dry_run: bool, trim_end: float = 0.0) -> None:
+                speed_override: float | None, dry_run: bool, trim_end: float = 0.0,
+                target_lufs: float | None = TARGET_LUFS) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     with open(csv_path, newline="", encoding="utf-8") as f:
@@ -266,6 +312,10 @@ def process_csv(csv_path: str, out_dir: str, api_key: str, compression: str,
         print(f"  {lang:<3} voice={s['voice_id']}  model={s['model_id']}  "
               f"speed={s['speed']}  stab={vs['stability']}  sim={vs['similarity_boost']}  "
               f"style={vs['style']}  spk_boost={vs['use_speaker_boost']}")
+    if target_lufs is not None:
+        print(f"Loudness  : normalize to {target_lufs} LUFS (peak ceiling {PEAK_CEILING_DB} dB)")
+    else:
+        print("Loudness  : normalization disabled")
     if dry_run:
         print("DRY RUN — no API calls or ffmpeg conversions will be made.")
     print()
@@ -313,9 +363,17 @@ def process_csv(csv_path: str, out_dir: str, api_key: str, compression: str,
             try:
                 print(f"  [GEN]  {out_name} ...", end=" ", flush=True)
                 mp3_bytes = synthesize(text, settings, api_key)
-                mp3_bytes_to_flac(mp3_bytes, out_path, compression, trim_end)
+                gain_db = None
+                if target_lufs is not None:
+                    measured = measure_integrated_lufs(mp3_bytes)
+                    if measured is None:
+                        print("[WARN: loudness unmeasurable, gain skipped]", end=" ")
+                    else:
+                        gain_db = target_lufs - measured
+                mp3_bytes_to_flac(mp3_bytes, out_path, compression, trim_end, gain_db)
                 size_kb = os.path.getsize(out_path) / 1024
-                print(f"✓  ({size_kb:.1f} KB)")
+                gain_note = f", gain {gain_db:+.1f} dB" if gain_db is not None else ""
+                print(f"✓  ({size_kb:.1f} KB{gain_note})")
                 done += 1
             except Exception as exc:
                 print(f"✗  ERROR: {exc}")
@@ -332,14 +390,79 @@ def process_csv(csv_path: str, out_dir: str, api_key: str, compression: str,
         sys.exit(1)
 
 
+# ── Normalize already-generated files (no API calls) ─────────────────────────
+def normalize_existing_flacs(out_dir: str, compression: str, target_lufs: float) -> None:
+    """Loudness-normalize every .flac in out_dir in place, without re-synthesis.
+
+    Idempotent: files within 1 dB of the target are left untouched. The
+    tolerance is deliberately that wide because a file whose gain was partly
+    absorbed by the limiter lands slightly under target; re-processing it
+    every run would just squash its peaks further without getting louder.
+    """
+    flac_files = sorted(Path(out_dir).glob("*.flac"))
+    if not flac_files:
+        print(f"No .flac files found in {out_dir}. Nothing to do.")
+        return
+
+    print(f"Files     : {len(flac_files)}")
+    print(f"Loudness  : normalize to {target_lufs} LUFS (peak ceiling {PEAK_CEILING_DB} dB)")
+    print()
+
+    done = 0
+    skipped = 0
+    errors = 0
+    for flac_path in flac_files:
+        try:
+            print(f"  [NORM] {flac_path.name} ...", end=" ", flush=True)
+            measured = measure_integrated_lufs(path=str(flac_path))
+            if measured is None:
+                print("skipped (loudness unmeasurable)")
+                skipped += 1
+                continue
+            gain_db = target_lufs - measured
+            if abs(gain_db) < 1.0:
+                print(f"already at {measured:.1f} LUFS, skipping")
+                skipped += 1
+                continue
+            tmp_path = flac_path.with_name(flac_path.stem + ".norm-tmp.flac")
+            cmd = [
+                "ffmpeg",
+                "-loglevel", "error",
+                "-i", str(flac_path),
+                "-vn",
+                "-c:a", "flac",
+                "-compression_level", compression,
+                "-af", ",".join(loudness_filters(gain_db)),
+                "-y", str(tmp_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True)
+            if result.returncode != 0:
+                tmp_path.unlink(missing_ok=True)
+                raise RuntimeError(result.stderr.decode(errors="replace").strip().splitlines()[-1])
+            os.replace(tmp_path, flac_path)
+            print(f"✓  ({measured:.1f} LUFS, gain {gain_db:+.1f} dB)")
+            done += 1
+        except Exception as exc:
+            print(f"✗  ERROR: {exc}")
+            errors += 1
+
+    print()
+    print("─" * 40)
+    print(f"Normalized: {done}")
+    print(f"Skipped:    {skipped}")
+    print(f"Errors:     {errors}")
+    if errors:
+        sys.exit(1)
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="ElevenLabs batch TTS → FLAC from a multilingual CSV file."
     )
     parser.add_argument(
-        "--csv", required=True,
-        help="Path to input CSV file",
+        "--csv",
+        help="Path to input CSV file (required unless --normalize-existing)",
     )
     parser.add_argument(
         "--out", default="./tts_output",
@@ -368,10 +491,36 @@ def main() -> None:
         help=f"Seconds to trim from the end of each generated file (default: {TAIL_TRIM_SECONDS})",
     )
     parser.add_argument(
+        "--lufs", type=float, default=TARGET_LUFS,
+        help="Loudness target in LUFS; every file is gained to this integrated "
+             f"loudness, with a {PEAK_CEILING_DB} dB peak limiter to prevent clipping. "
+             f"Less negative = louder (default: {TARGET_LUFS}).",
+    )
+    parser.add_argument(
+        "--no-normalize", action="store_true",
+        help="Disable loudness normalization (keep raw ElevenLabs levels)",
+    )
+    parser.add_argument(
+        "--normalize-existing", action="store_true",
+        help="Skip generation entirely; loudness-normalize all existing .flac "
+             "files in --out in place (no API key needed, idempotent)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Preview what would be generated without calling the API or ffmpeg",
     )
     args = parser.parse_args()
+
+    target_lufs = None if args.no_normalize else args.lufs
+
+    if args.normalize_existing:
+        if target_lufs is None:
+            sys.exit("ERROR: --normalize-existing and --no-normalize are contradictory.")
+        normalize_existing_flacs(args.out, args.compression, target_lufs)
+        return
+
+    if not args.csv:
+        sys.exit("ERROR: --csv is required (unless using --normalize-existing).")
 
     api_key = resolve_api_key(args.api_key, args.config)
     if not args.dry_run and not api_key:
@@ -381,7 +530,7 @@ def main() -> None:
         )
 
     process_csv(args.csv, args.out, api_key, args.compression, args.speed, args.dry_run,
-                args.trim_end)
+                args.trim_end, target_lufs)
 
 
 if __name__ == "__main__":

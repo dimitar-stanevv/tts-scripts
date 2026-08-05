@@ -151,13 +151,33 @@ python generate_tts.py --csv tts_messages_all_languages.csv [options]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--csv PATH` | *(required)* | Path to input CSV file |
+| `--csv PATH` | *(required unless `--normalize-existing`)* | Path to input CSV file |
 | `--out DIR` | `./tts_output` | Directory where `.flac` files are saved (created if it does not exist) |
 | `--config PATH` | `local_config.ini` next to `generate_tts.py` | INI file with `[elevenlabs] api_key = ...` |
 | `--api-key KEY` | *(see API key section)* | Overrides env var and config file. |
 | `--compression N` | `5` | FLAC compression level 0–12. Higher values produce smaller files at the cost of encoding time. |
 | `--speed N` | *(per-language `__speed` from CSV)* | Override speech speed for **all** languages, ignoring the CSV `__speed` row. |
+| `--trim-end SECONDS` | `0` (off) | Seconds trimmed from the end of each generated file. Off by default — ElevenLabs leaves a variable amount of trailing silence, so a fixed cut chopped the final word on any file with less silence than the trim. |
+| `--lufs N` | `-14.0` | Loudness target (EBU R128 integrated LUFS). Less negative = louder, e.g. `-12`. |
+| `--no-normalize` | off | Disable loudness normalization and keep raw ElevenLabs levels. |
+| `--normalize-existing` | off | Skip generation; loudness-normalize all existing `.flac` files in `--out` **in place**. No API key needed, safe to re-run (idempotent). |
 | `--dry-run` | off | Preview all jobs without making API calls or running ffmpeg. |
+
+### Loudness normalization
+
+Raw ElevenLabs output varies noticeably per voice/language (measured −16.6 to −22.1 LUFS
+across this repo's languages). Every generated file is therefore measured (ffmpeg
+`ebur128`) and gained to a common integrated-loudness target (default **−14 LUFS**), with
+a **−1 dB peak limiter** so the added gain can never clip. This makes all files both
+louder and equally loud across languages. Tune with `--lufs` (e.g. `--lufs -12` for
+louder) or turn it off with `--no-normalize`.
+
+Files generated **before** this feature can be brought to the same level without
+re-synthesis (no API cost):
+
+```bash
+python generate_tts.py --normalize-existing --out ./tts_output
+```
 
 ---
 
@@ -186,6 +206,12 @@ python generate_tts.py \
   --out ./output \
   --compression 12 \
   --speed 1.0
+
+# Make already-generated files louder without re-calling the API
+python generate_tts.py --normalize-existing --out ./tts_output
+
+# Louder target for new files
+python generate_tts.py --csv tts_messages_all_languages.csv --lufs -12
 ```
 
 ---
@@ -233,8 +259,11 @@ For each message row:
   For each language column with non-empty text:
     1. Look up that language's voice_id / model_id / speed / voice_settings
     2. POST to ElevenLabs API  →  receive MP3 bytes in memory
-    3. Pipe MP3 bytes into ffmpeg via stdin  →  write {filename}_{lang}.flac
-    4. Sleep 0.5 s to respect the 2 req/s rate limit
+    3. Measure integrated loudness of the MP3 bytes (ffmpeg ebur128)
+    4. Pipe MP3 bytes into ffmpeg via stdin  →  gain to the LUFS target
+       (limiter at -1 dB), trim tail if --trim-end was passed  →  write
+       {filename}_{lang}.flac
+    5. Sleep 0.5 s to respect the 2 req/s rate limit
 ```
 
 No temporary files are created. If a job fails, the error is logged and the script continues with the next cell. The final exit code is non-zero if any errors occurred.
